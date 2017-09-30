@@ -1,16 +1,37 @@
 #!/usr/bin/env python
+"""
+UI:
+    Display made for https://learn.adafruit.com/adafruit-pioled-128x32-mini-oled-for-raspberry-pi/
+    Font are:
+        https://fonts2u.com/fairfax.font
+        https://fonts2u.com/fairfax-bold.font
+"""
 
 import os
 import rtmidi
 import threading
 from time import time
+from functools import partial
 from pynput.keyboard import Listener, Key, KeyCode
 from rtmidi.midiconstants import (ALL_SOUND_OFF, CONTROL_CHANGE,
                                   RESET_ALL_CONTROLLERS, NOTE_ON,
                                   NOTE_OFF)
+from PIL import Image, ImageDraw, ImageFont
+
+try:
+    import tkinter as tk
+    from PIL import ImageTk
+except:
+
+    tk = None
+
 global looper
 Char = KeyCode.from_char
 midi_in_callback = None
+SIZE = (128, 32)
+DPI = 10
+size = [x * DPI for x in SIZE]
+image = None
 
 
 class Track(object):
@@ -70,10 +91,12 @@ class Player(threading.Thread):
     def __init__(self):
         super(Player, self).__init__()
         self.is_playing = threading.Event()
+        self.is_playing.clear()
         self.daemon = True
         self.quit = False
         self.looper = None
         self.restart = False
+        self.time_start = 0
         self.start()
         self.midiout = rtmidi.MidiOut()
         self.midiout.open_port(1)
@@ -179,12 +202,32 @@ class Looper(object):
         self.tracks = {}
         self.shift = False
         self.ctrl = False
-        self.length = None
         self._key_pressed = []
         self._record_to_track = None
         self.record_on_first_note = True
         self.player = Player()
         self.player.looper = self
+        self.bpm = 120
+        self.beat_per_measures = 4
+        self.measures = 4
+        self.recalculate_length()
+
+    def recalculate_length(self):
+        self.beat_length = 60 / float(self.bpm)
+        self.measure_length = self.beat_length * self.beat_per_measures
+        self.length = self.measure_length * self.measures
+
+    @property
+    def measure(self):
+        if not self.player.is_playing.is_set():
+            return 1
+        return 1 + int(self.player.deltatime / self.measure_length) % self.measures
+
+    @property
+    def beat(self):
+        if not self.player.is_playing.is_set():
+            return 1
+        return 1 + int((self.player.deltatime / self.beat_length) % self.beat_per_measures)
 
     def reset(self):
         self.stop()
@@ -209,12 +252,7 @@ class Looper(object):
         self.record_on_first_note = not self.record_on_first_note
 
     def record(self, index):
-        if not self.length:
-            if self.record_on_first_note:
-                self._record_time = None
-            else:
-                self._record_time = time()
-        else:
+        if not self.record_on_first_note:
             self.play()
         self._record_to_track = track = self.get_track(index)
         track.start_recording()
@@ -223,26 +261,21 @@ class Looper(object):
         self.get_track(index).toggle_mute()
 
     def record_after(self, index):
-        if self._record_time is None:
-            return
-        deltatime = time() - self._record_time
-        if self.length is None:
-            self.length = deltatime
         self._record_to_track.stop_recording()
         self._record_to_track = None
 
     def midi_in_callback(self, wallclock, message, data):
-        if self._record_to_track:
-            if self.length is None:
-                if self._record_time is None:
-                    if message[0] & 0xF0 == NOTE_ON:
-                        self._record_time = time()
-                if self._record_time is None:
-                    return
-                deltatime = time() - self._record_time
-            else:
-                deltatime = self.player.deltatime % self.length
-            self._record_to_track.midi_in_callback(deltatime, message, data)
+        if not self._record_to_track:
+            return
+
+        is_note = (message[0] & 0xF0 == NOTE_ON)
+        if not is_note:
+            return
+        if self.record_on_first_note:
+            if not self.player.is_playing.is_set():
+                self.player.play()
+        deltatime = self.player.deltatime % self.length
+        self._record_to_track.midi_in_callback(deltatime, message, data)
 
     def get_track(self, index):
         if index not in self.tracks:
@@ -312,6 +345,60 @@ class MidiInputHandler(object):
         print("[%s] @%0.6f %r" % (self.port, self._wallclock, message))
 
 
+class UI(threading.Thread):
+    def __init__(self):
+        super(UI, self).__init__()
+        width, height = size
+        self.image = Image.new('1', (width, height))
+        self.draw = ImageDraw.Draw(self.image)
+        self.font = ImageFont.truetype("fonts/Fairfax.ttf", size=10 * DPI)
+        self.daemon = True
+        self.start()
+
+    def run(self):
+        if tk:
+            self.root = tk.Tk()
+            self.root.title("Midi Looper")
+            self.root.geometry("{}x{}+0+0".format(*size))
+            self.image1 = ImageTk.PhotoImage(self.image)
+            self.panel = tk.Label(self.root, image=self.image1)
+            self.panel.pack()
+            self.root.after(50, self.render_and_display)
+            self.root.mainloop()
+
+    def render_and_display(self):
+        self.render()
+        self.display()
+        self.root.after(50, self.render_and_display)
+
+    def render(self):
+        # ▶◼⚪⚫ (~25 chars width)
+        width, height = size
+        d = self.draw
+        font = self.font
+        player = looper.player
+
+        def text(x, y, message):
+            d.text((x * DPI, y * DPI), message, font=font, fill=255)
+
+        d.rectangle((0, 0, width, height), outline=0, fill=0)
+
+        state = u"‣" if player.is_playing.is_set() else u"▪"
+        top = "{state} {bpm} {measure}-{measures} {beat}{beatleft}".format(
+            state=state,
+            bpm=looper.bpm,
+            measure=looper.measure,
+            measures=looper.measures,
+            beat="⚫" * looper.beat,
+            beatleft="⚪" * (looper.beat_per_measures - looper.beat)
+        )
+
+    def display(self):
+        if tk:
+            self.image1 = ImageTk.PhotoImage(self.image)
+            self.panel.configure(image=self.image1)
+
+
 def on_keyboard_pressed(key):
     if looper:
         looper.on_key_pressed(key)
@@ -339,6 +426,8 @@ try:
     port_name = midi_in.get_ports()[port]
     midi_in.set_callback(MidiInputHandler(port_name))
     midi_in.open_port(port)
+
+    ui = UI()
 
     with Listener(on_press=on_keyboard_pressed, on_release=on_keyboard_released) as listener:
         listener.join()
