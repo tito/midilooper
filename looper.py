@@ -37,6 +37,7 @@ SIZE = (128, 32)
 DPI = 5
 size = [x * DPI for x in SIZE]
 image = None
+LAG = 10 / 1000.
 
 
 class Track(object):
@@ -51,6 +52,7 @@ class Track(object):
         self.looper = looper
 
     def quantize(self, clock, m):
+        clock -= LAG
         diff = (clock % m)
         clock -= diff
         if diff > m / 2:
@@ -58,7 +60,7 @@ class Track(object):
         return clock
 
     def midiin_callback(self, clock, m, data):
-        print("track {}: {} {}".format(self.index, clock, m, data))
+        # print("track {}: {} {}".format(self.index, clock, m, data))
         if not self.recording:
             return
         status = m[0] & 0xF0
@@ -136,6 +138,7 @@ class Player(threading.Thread):
         deltatime = 0
         play_notes = self.play_notes
         looper = self.looper
+        tick = 0
 
         while not self.quit:
 
@@ -152,12 +155,22 @@ class Player(threading.Thread):
             now = (time() - self.time_start)
             deltatime = now % length
 
+            interval = looper.beat_length
+            if now - tick > interval:
+                self.tick()
+                tick = now
+
             if deltatime > prev_deltatime:
                 play_notes(looper, prev_deltatime, deltatime)
             else:
                 play_notes(looper, prev_deltatime, length)
                 self.merge_track_notes()
                 play_notes(looper, 0, deltatime)
+
+    def tick(self):
+        if self.looper.with_tick:
+            self.midiout.send_message([NOTE_ON, 42, 50])
+        # self.midiout.send_message([NOTE_ON, 42, 0])
 
     def play_notes(self, looper, start, stop):
         for track in list(looper.tracks.values()):
@@ -179,6 +192,7 @@ class Player(threading.Thread):
         self.restart = True
         self._is_playing.set()
         self.midiout.send_message([SONG_START])
+        self.tick()
 
     def stop(self):
         if not self.playing:
@@ -207,6 +221,8 @@ class Looper(object):
     commands = {
         Char("r"): "reset",
 
+        Char("a"): "stop_record",
+
         Char("w"): ("record", [1]),
         Char("x"): ("record", [2]),
         Char("c"): ("record", [3]),
@@ -225,6 +241,15 @@ class Looper(object):
         Char("j"): ("mute", [7]),
         Char("k"): ("mute", [8]),
 
+        Char("1"): ("toggle_channel", [1]),
+        Char("2"): ("toggle_channel", [2]),
+        Char("3"): ("toggle_channel", [3]),
+        Char("4"): ("toggle_channel", [4]),
+        KeyCode(65437): ("toggle_channel", [5]),
+        Char("6"): ("toggle_channel", [6]),
+        Char("7"): ("toggle_channel", [7]),
+        Char("8"): ("toggle_channel", [8]),
+
         Char("+"): ("increment_measure", [1]),
         Char("-"): ("increment_measure", [-1]),
         Key.page_up: ("increment_tempo", [10]),
@@ -236,6 +261,7 @@ class Looper(object):
 
         Key.f12: "save_settings",
         Key.f11: "load_settings",
+        Key.f9: "toggle_tick",
 
         Key.space: "toggle_play",
         Key.esc: "panic",
@@ -244,9 +270,6 @@ class Looper(object):
         Char("*"): "midi_next_port"
     }
 
-    shift_commands = {}
-    ctrl_commands = {}
-
     QUANTIZE = (1, 2, 3, 4, 8)
 
     def __init__(self):
@@ -254,13 +277,15 @@ class Looper(object):
         self.shift = False
         self.ctrl = False
         self._key_pressed = []
-        self._record_to_track = None
+        self.active_track = None
         self.record_on_first_note = True
         self.bpm = 120
         self.beat_per_measures = 4
         self.measures = 4
         self.port = 0
         self.quantize = 16
+        self.channels = [False] * 8
+        self.with_tick = False
         self.midiin = rtmidi.MidiIn()
         self.midiout = rtmidi.MidiOut()
         self.midiin_name = self.midiout_name = ""
@@ -279,6 +304,18 @@ class Looper(object):
         index = max(0, (index - 1))
         self.quantize = self.QUANTIZE[index]
 
+    def stop_record(self):
+        for track in self.tracks.values():
+            track.stop_recording()
+        self.active_track = None
+
+    def toggle_channel(self, index):
+        index -= 1
+        self.channels[index] = not self.channels[index]
+
+    def toggle_tick(self):
+        self.with_tick = not self.with_tick
+
     @property
     def settings(self):
         return {
@@ -289,7 +326,8 @@ class Looper(object):
             "port": self.port,
             "record_on_first_note": self.record_on_first_note,
             "quantize": self.quantize,
-            "tracks": self.dump_tracks()
+            "tracks": self.dump_tracks(),
+            "channels": self.channels
         }
 
     def dump_tracks(self):
@@ -318,6 +356,7 @@ class Looper(object):
                 self.record_on_first_note = settings["record_on_first_note"]
                 self.port = settings["port"]
                 self.quantize = settings["quantize"]
+                self.channels = settings["channels"]
                 self.recalculate_length()
                 self.open_midi_port()
 
@@ -383,6 +422,9 @@ class Looper(object):
     def reset(self):
         self.stop()
         self.tracks = {}
+        if self.active_track:
+            self.active_track.stop_recording()
+            self.active_track = None
 
     def panic(self):
         self.player.panic()
@@ -402,48 +444,56 @@ class Looper(object):
         self.record_on_first_note = not self.record_on_first_note
 
     def record(self, index):
-        prev_index = 0
-        if self._record_to_track:
-            self._record_to_track.stop_recording()
-            prev_index = self._record_to_track.index
-        self._record_to_track = track = self.get_track(index)
-        if track.index == prev_index:
-            self._record_to_track = None
-            return
         if self.ctrl:
-            track.reset()
+            self.get_track(index).reset()
             return
-        if not self.record_on_first_note:
-            self.play()
-        track.start_recording()
+
+        active_index = -1
+        if self.active_track:
+            active_index = self.active_track.index
+            self.active_track.stop_recording()
+            self.active_track = None
+            if active_index == index:
+                return
+        self.active_track = track = self.get_track(index)
+        if track.recording:
+            track.stop_recording()
+        else:
+            if not self.record_on_first_note:
+                self.play()
+            track.start_recording()
 
     def mute(self, index):
         self.get_track(index).toggle_mute()
 
     def _record_after(self, index):
-        self._record_to_track.stop_recording()
-        self._record_to_track = None
+        self.get_track(index).stop_recording()
 
     def midiin_callback(self, blob, data):
+        print("MIDI IN: {}".format(blob))
         message, deltatime = blob
 
         # control part
         if message[0] == SONG_START:
-            self.play()
+            return self.play()
         elif message[0] == SONG_STOP:
-            self.stop()
-
-        if not self._record_to_track:
-            return
+            return self.stop()
 
         is_note = (message[0] & 0xF0 == NOTE_ON)
         if not is_note:
             return
+
+        channel = message[0] & 0x0F
+        if not self.channels[channel]:
+            return
+        if not self.active_track:
+            return
+
         if self.record_on_first_note:
             if not self.player.playing:
                 self.player.play()
         deltatime = self.player.deltatime % self.length
-        self._record_to_track.midiin_callback(deltatime, message, data)
+        self.active_track.midiin_callback(deltatime, message, data)
 
     def get_track(self, index):
         if index not in self.tracks:
@@ -458,12 +508,7 @@ class Looper(object):
         func(*args)
 
     def get_command(self, key, after=False):
-        if self.shift:
-            commands = self.shift_commands
-        elif self.ctrl:
-            commands = self.ctrl_commands
-        else:
-            commands = self.commands
+        commands = self.commands
         cmd = commands.get(key)
         if not cmd:
             return None, None, None
@@ -499,18 +544,6 @@ class Looper(object):
         elif key in self._key_pressed:
             self._key_pressed.remove(key)
             self.dispatch_command(key, after=True)
-
-
-class MidiInputHandler(object):
-    def __init__(self, port):
-        self.port = port
-        self._wallclock = time()
-
-    def __call__(self, event, data=None):
-        message, deltatime = event
-        self._wallclock += deltatime
-        looper.midiin_callback(self._wallclock, message, data)
-        print("[%s] @%0.6f %r" % (self.port, self._wallclock, message))
 
 
 class UI(threading.Thread):
@@ -554,8 +587,10 @@ class UI(threading.Thread):
             d.text(((mx + x) * DPI, y * DPI), message, font=font, fill=255)
 
         state = u"‣" if player.playing else u"■"
-        quantize = "{}".format(looper.quantize).ljust(2)
-        top = "{state} {bpm} {measure}-{measures} {quantize} {beat}{beatleft} {port}".format(
+        quantize = str(looper.quantize)
+        channels = "".join([("+" if x else "-") for x in looper.channels])
+        with_tick = "T" if looper.with_tick else " "
+        top = "{state} {bpm} {measure}-{measures} {quantize}{tick}{beat}{beatleft} {channels}".format(
             state=state,
             bpm=looper.bpm,
             measure=looper.measure,
@@ -563,7 +598,9 @@ class UI(threading.Thread):
             beat="⚫" * looper.beat,
             beatleft="⚪" * (looper.beat_per_measures - looper.beat),
             port=looper.midiin_name,
-            quantize=quantize
+            channels=channels,
+            quantize=quantize,
+            tick=with_tick
         )
 
         def render_status(index):
